@@ -13,9 +13,9 @@
         "branch": "main"
       },
       "description": "Testing Classroom 50 and GH Classroom alt",
-      "due": "2026-06-24T12:12:00Z",
+      "due": "2026-07-08T12:12:00Z",
       "due_meta": {
-        "input": "2026-06-24T09:12:00",
+        "input": "2026-07-08T09:12:00",
         "zone": "America/Moncton",
         "offset": "-03:00",
         "source": "auto-detected"
