@@ -1,0 +1,11 @@
+{
+  "schema": "classroom50/classroom/v1",
+  "name": "FAKE NAME TO TEST WITH",
+  "short_name": "fake-name-to-test-with",
+  "term": "Fall2026",
+  "org": "nbcc-wmad",
+  "team": {
+    "id": 18176289,
+    "slug": "classroom50-fake-name-to-test-with"
+  }
+}
