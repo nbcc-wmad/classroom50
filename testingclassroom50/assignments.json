@@ -1,4 +1,25 @@
 {
   "schema": "classroom50/assignments/v1",
-  "assignments": []
+  "assignments": [
+    {
+      "slug": "testforstudents",
+      "name": "TestForStudents",
+      "mode": "individual",
+      "autograder": "default",
+      "feedback_pr": true,
+      "template": {
+        "owner": "nbcc-wmad",
+        "repo": "PHP-Final-2025SrC",
+        "branch": "main"
+      },
+      "description": "Testing Classroom 50 and GH Classroom alt",
+      "due": "2026-06-24T12:12:00Z",
+      "due_meta": {
+        "input": "2026-06-24T09:12:00",
+        "zone": "America/Moncton",
+        "offset": "-03:00",
+        "source": "auto-detected"
+      }
+    }
+  ]
 }
