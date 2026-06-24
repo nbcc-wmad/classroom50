@@ -22,7 +22,7 @@
     },
     {
       "slug": "assignment-01",
-      "name": "Assignment_01",
+      "name": "Assignment-01",
       "mode": "individual",
       "autograder": "default",
       "feedback_pr": true,
