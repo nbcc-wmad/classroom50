@@ -1,0 +1,11 @@
+{
+  "schema": "classroom50/classroom/v1",
+  "name": "Assignment_0",
+  "short_name": "assignment-0",
+  "term": "Fall2026",
+  "org": "nbcc-wmad",
+  "team": {
+    "id": 18176202,
+    "slug": "classroom50-assignment-0"
+  }
+}
