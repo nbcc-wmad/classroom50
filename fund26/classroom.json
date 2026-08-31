@@ -1,0 +1,25 @@
+{
+  "schema": "classroom50/classroom/v1",
+  "name": "Fund26",
+  "short_name": "fund26",
+  "term": "",
+  "org": "nbcc-wmad",
+  "team": {
+    "id": 19257940,
+    "slug": "classroom50-fund26"
+  },
+  "teams": {
+    "teacher": {
+      "id": 19257941,
+      "slug": "classroom50-fund26-teacher"
+    },
+    "hta": {
+      "id": 19257942,
+      "slug": "classroom50-fund26-hta"
+    },
+    "ta": {
+      "id": 19257943,
+      "slug": "classroom50-fund26-ta"
+    }
+  }
+}
