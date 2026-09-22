@@ -6,14 +6,14 @@ every submission. Reads env, resolves an entrypoint (per-assignment
 autograder.py > per-assignment tests.json > classroom-default autograder.py
 > vacuous pass), execs it in the student checkout, then reads/synthesizes
 result.json + release-body.md + $GITHUB_OUTPUT so downstream steps always
-have a v1-shaped payload. Per-assignment grading lives in autograder.py —
-see the Advanced-Autograding wiki page.
+have a v1-shaped payload. Per-assignment grading lives in autograder.py; see
+the Advanced-Autograding wiki page.
 
 Exits 0 for EVERY grading outcome, including failures (reported via a
 synthetic error result + status=error) so the release/commit-status steps
 still fire and the gradebook ingests the submission. Only missing required
 identity env (PAGES_BASE_URL, CLASSROOM, ASSIGNMENT, SUBMISSION_TAG) fails
-fast with exit 1 — those are needed to synthesize a v1 result.json, and
+fast with exit 1: those are needed to synthesize a v1 result.json, and
 this only happens when run outside the workflow.
 
 Environment (set by the autograde-runner workflow):
@@ -57,9 +57,16 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-# Schema sentinel — keep in lockstep with collect_scores.py::validate_result
+# Schema sentinel. Keep in lockstep with collect_scores.py::validate_result
 # (cli/gh-teacher/skeleton/dotgithub/scripts/collect_scores.py).
 RESULT_SCHEMA_V1 = "classroom50/result/v1"
+# Any version of the sentinel: a staged release asset carrying one is refused
+# (see _looks_like_result_document). Files above the readers' asset ceiling
+# can't be read as a score, so they aren't parsed. Keep in lockstep with
+# collect_scores.py::MAX_RESULT_BYTES and download.go maxResultBytes
+# (test_contract_parity.py pins the sniff at or above the collector's).
+RESULT_SCHEMA_PREFIX = "classroom50/result/"
+RESULT_SNIFF_MAX_BYTES = 10 * 1024 * 1024
 
 # result.json is required; release-body.md optional (synthesized when
 # missing). Lockstep with contract.ResultFilename / contract.ReleaseBodyFilename
@@ -88,17 +95,24 @@ TESTS_SCHEMA_V1 = "classroom50/tests/v1"
 # commands are each bounded by it independently.
 DEFAULT_TEST_TIMEOUT = 10
 
+# Env var handed to every setup/run command and autograder.py: the absolute
+# path of the extracted per-assignment bundle. Commands run with cwd at the
+# student checkout, so this is the only way a declarative test can reach a
+# teacher-only script or fixture that must stay out of the template.
+BUNDLE_DIR_ENV = "CLASSROOM50_BUNDLE_DIR"
+
 # Cap captured stdout/stderr in the release body so a runaway program can't
 # bloat the published release.
 MAX_CAPTURED_CHARS = 2000
 
 # Far roomier cap for the Actions log, where long failure output (a LaTeX
-# build log, a compiler spew) is the whole point (#612) — the log viewer
+# build log, a compiler spew) is the whole point (#612). The log viewer
 # handles megabytes, the release body must stay skimmable.
 MAX_LOG_CAPTURED_CHARS = 100_000
 
 # Per-test failure-detail levels -- mirror tests.go / tests-v1.schema.json.
-# full: diff (exact) or expected+actual blocks, plus stderr (the default).
+# full: io tests show a diff (exact) or expected+actual blocks plus stderr;
+# run/python tests show the command's combined output (the default).
 # actual-only: the student's own output, never the expected side or a diff.
 # none: just the failure-kind summary line.
 FAILURE_DETAILS_FULL = "full"
@@ -129,7 +143,7 @@ COMPARISON_REGEX = "regex"
 COMPARISONS = (COMPARISON_INCLUDED, COMPARISON_EXACT, COMPARISON_REGEX)
 
 # Bounded retry for Pages fetches: 1s then 2s between attempts (final attempt
-# raises) on transient network errors / HTTP 5xx. 404 is NOT retried — for the
+# raises) on transient network errors / HTTP 5xx. 404 is NOT retried: for the
 # bundle URL it means "no per-assignment override"; for the classroom-default
 # URL it means the classroom hasn't run `gh teacher autograder set-default`
 # (falls back to a vacuous-pass result).
@@ -163,10 +177,19 @@ ACCEPT_COMMIT_PATHS = frozenset(
     }
 )
 
+# Paths the accept commit may DELETE (never add or modify): an init_shim accept
+# creates the repo with auto_init, which seeds a README the assignment contract
+# says must not exist, so the same commit removes it. Both accept clients
+# hand-mirror the path: classroomcfg.SeededReadmePath (gh-student) and the
+# init_shim deletePaths in web/src/domain/assignments/accept.ts -- keep in
+# lockstep. Deletion-only, so a tip accept commit that ADDS or EDITS a README
+# (a student's amended work) still grades.
+ACCEPT_COMMIT_DELETED_PATHS = frozenset({"README.md"})
+
 # Paths a teacher-side submission-mode shim retrofit touches: exactly the shim,
 # nothing else. Such a commit carries `[skip ci]` so the workflow normally
 # never fires; is_shim_update_commit is the backstop for environments that
-# strip it. Mirrors contract.ShimUpdateCommitMessage's write path — keep in
+# strip it. Mirrors contract.ShimUpdateCommitMessage's write path; keep in
 # lockstep with classroomcfg.AutogradeWorkflowPath.
 SHIM_UPDATE_COMMIT_PATHS = frozenset({".github/workflows/autograde.yaml"})
 
@@ -208,7 +231,7 @@ def runtime_root() -> pathlib.Path:
 
 
 # ---------------------------------------------------------------------------
-# Pure helpers (no I/O — fully unit-testable)
+# Pure helpers (no I/O, fully unit-testable)
 # ---------------------------------------------------------------------------
 
 
@@ -270,7 +293,7 @@ def classroom_default_autograder_url(pages_base_url: str, classroom: str, secret
     """Pages URL for a classroom's default autograder.py.
 
     Published verbatim by publish-pages.yaml from `<classroom>/autograder.py`.
-    Optional — classrooms that haven't run `gh teacher autograder set-default`
+    Optional: classrooms that haven't run `gh teacher autograder set-default`
     won't have one, and the runner falls back to a vacuous-pass result.
     """
     return f"{pages_base_url}/{_classroom_segment(classroom, secret)}/{ENTRYPOINT_FILENAME}"
@@ -318,7 +341,8 @@ def make_result(
     review_link is None.
 
     `username` is the repo OWNER, emitted as `owner` (the identity anchor
-    the collector validates). `assignment_type` ("individual"|"group")
+    the collector validates; for a team assignment the repo-name tail
+    `group-<n>`). `assignment_type` ("individual"|"group"|"team")
     records the mode. No `usernames` field: who pushed is `submitted_by`,
     who owns the repo is `owner`, the credited member list is resolved by
     collection.
@@ -362,7 +386,7 @@ def empty_result(
     submitted_by: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """A v1-valid result.json payload with no tests (score 0/0). Used for
-    every error path — collect-scores ingests it as "submitted, error"; the
+    every error path: collect-scores ingests it as "submitted, error"; the
     workflow log carries the actual failure reason.
     """
     return make_result(
@@ -385,7 +409,7 @@ def empty_result(
 def derive_status_and_summary(result: dict[str, Any]) -> tuple[str, str]:
     """Map a result.json payload to a commit-status state + summary line.
 
-    `success` when all tests pass (or zero tests — vacuous pass, "no
+    `success` when all tests pass (or zero tests: vacuous pass, "no
     autograder configured"). `failure` when any test failed. The error path
     is set explicitly by the runner, never derived here.
     """
@@ -397,7 +421,7 @@ def derive_status_and_summary(result: dict[str, Any]) -> tuple[str, str]:
     if not tests:
         return (
             "success",
-            f"classroom50 autograde: submitted — no autograder configured for {assignment}",
+            f"classroom50 autograde: submitted, no autograder configured for {assignment}",
         )
 
     passed = sum(1 for t in tests if t.get("passed"))
@@ -436,6 +460,7 @@ def render_release_body(result: dict[str, Any], summary: str) -> str:
 
 def validate_result(
     data: Any, *, classroom: str, assignment: str, is_group: bool = False,
+    expected_type: str | None = None,
     owner: str | None = None,
 ) -> str | None:
     """None if `data` is v1-shaped for the given identity, else a
@@ -444,13 +469,15 @@ def validate_result(
     Mirrors collect_scores.py::validate_result so a payload passing here also
     passes gradebook ingest. Without parity, a malformed result.json (missing
     `owner`, non-int score, non-dict test entry, ...) would silently pass the
-    runner, get published, and only be rejected on the next collect-scores run
-    — the student appears not-yet-submitted with no signal in the log.
+    runner, get published, and only be rejected on the next collect-scores run,
+    so the student appears not-yet-submitted with no signal in the log.
 
     `owner` (repo owner login) is the identity anchor: when provided it must
-    equal `data["owner"]`. `assignment_type` must be "individual"/"group" and
-    match the run's mode. No `usernames` field: who pushed is `submitted_by`,
-    who owns is `owner`, the credited member list is resolved by collection.
+    equal `data["owner"]`. `assignment_type` must equal the run's
+    `expected_type` ("individual"/"group"/"team"); the legacy `is_group`
+    boolean is honored when `expected_type` is not supplied. No `usernames`
+    field: who pushed is `submitted_by`, who owns is `owner`, the credited
+    member list is resolved by collection.
     """
     if not isinstance(data, dict):
         return f"{RESULT_FILENAME} is not a JSON object"
@@ -476,7 +503,8 @@ def validate_result(
             f"(derived from the repo name)"
         )
 
-    expected_type = "group" if is_group else "individual"
+    if expected_type is None:
+        expected_type = "group" if is_group else "individual"
     assignment_type = data.get("assignment_type")
     if assignment_type != expected_type:
         return (
@@ -487,7 +515,7 @@ def validate_result(
     # submit/* here is the RECORD namespace, deliberately not the configurable
     # submission_tags patterns: a milestone-tag run (e.g. phase1) mints/reuses
     # the canonical submit/<ts>-<sha> tag in the workflow's tag step BEFORE
-    # grading, so SUBMISSION_TAG — and thus result.json's `submission` — is
+    # grading, so SUBMISSION_TAG (and thus result.json's `submission`) is
     # always canonical. Custom tags trigger; submit/* records.
     submission = data.get("submission")
     if not isinstance(submission, str) or not submission.startswith("submit/"):
@@ -528,7 +556,7 @@ def validate_result(
             return f"{RESULT_FILENAME} 'tests[{i}].score' ({ts}) > 'tests[{i}].max-score' ({tm})"
 
     # submitted_by is optional (older results omit it). When present: object
-    # with a non-empty string username and int-or-null id — stamped by the
+    # with a non-empty string username and int-or-null id, stamped by the
     # runner from GITHUB_ACTOR/GITHUB_ACTOR_ID.
     err = validate_submitted_by(data.get("submitted_by"), RESULT_FILENAME)
     if err is not None:
@@ -656,11 +684,12 @@ def is_acceptance_commit(workspace: pathlib.Path, head_sha: str) -> bool:
     empty head_sha, or no accept commit.
 
     Final guard: the tip accept commit must touch ONLY the known setup paths
-    (`ACCEPT_COMMIT_PATHS`). A student can rewrite history so the marker commit
-    is the tip yet carries real work (amend + force-push, or a squash); skipping
-    it would silently drop gradeable work, so an accept commit touching anything
-    outside the setup set fails open (grade). A git error reading its paths also
-    fails open.
+    (`ACCEPT_COMMIT_PATHS`), plus at most a deletion of a path in
+    `ACCEPT_COMMIT_DELETED_PATHS`. A student can rewrite history so the marker
+    commit is the tip yet carries real work (amend + force-push, or a squash);
+    skipping it would silently drop gradeable work, so an accept commit touching
+    anything outside the setup set fails open (grade). A git error reading its
+    paths also fails open.
     """
     if not head_sha:
         return False
@@ -672,11 +701,15 @@ def is_acceptance_commit(workspace: pathlib.Path, head_sha: str) -> bool:
 
 def _accept_commit_is_setup_only(workspace: pathlib.Path, head_sha: str) -> bool:
     """True only when every path the commit touches is in the known setup set
-    (`ACCEPT_COMMIT_PATHS`). Fails open (False -> grade) on any git error or an
-    empty path list, so a commit we can't fully inspect is treated as a
-    submission rather than silently skipped.
+    (`ACCEPT_COMMIT_PATHS`), or is a deletion of a path in
+    `ACCEPT_COMMIT_DELETED_PATHS` (the auto_init README an init_shim accept
+    removes). Fails open (False -> grade) on any git error or an empty path
+    list, so a commit we can't fully inspect is treated as a submission rather
+    than silently skipped.
     """
-    return _commit_touches_only(workspace, head_sha, ACCEPT_COMMIT_PATHS)
+    return _commit_touches_only(
+        workspace, head_sha, ACCEPT_COMMIT_PATHS, ACCEPT_COMMIT_DELETED_PATHS
+    )
 
 
 def is_shim_update_commit(workspace: pathlib.Path, head_sha: str) -> bool:
@@ -689,7 +722,7 @@ def is_shim_update_commit(workspace: pathlib.Path, head_sha: str) -> bool:
     shim-only commit has nothing to grade regardless of who authored it, and a
     student hand-editing their shim gets a skip either way (the edit alone is
     never gradeable work). Fails open (False -> grade) on any uncertainty.
-    The acceptance check takes precedence at the call site — the accept commit
+    The acceptance check takes precedence at the call site: the accept commit
     also touches the shim but additionally lands the marker, so the path sets
     never overlap in practice.
 
@@ -703,12 +736,15 @@ def is_shim_update_commit(workspace: pathlib.Path, head_sha: str) -> bool:
 
 
 def _commit_touches_only(
-    workspace: pathlib.Path, head_sha: str, allowed: frozenset[str]
+    workspace: pathlib.Path,
+    head_sha: str,
+    allowed: frozenset[str],
+    allowed_deletions: frozenset[str] = frozenset(),
 ) -> bool:
-    """True only when every path the commit touches is in `allowed`. Fails
-    open (False -> grade) on any git error or an empty path list, so a commit
-    we can't fully inspect is treated as a submission rather than silently
-    skipped.
+    """True only when every path the commit touches is in `allowed`, or is a
+    DELETION of a path in `allowed_deletions`. Fails open (False -> grade) on
+    any git error or an empty path list, so a commit we can't fully inspect is
+    treated as a submission rather than silently skipped.
     """
 
     def git(*args: str) -> subprocess.CompletedProcess[str]:
@@ -718,19 +754,34 @@ def _commit_touches_only(
         )
 
     try:
-        # Names of every path the commit changed vs its parent (root commit:
-        # vs the empty tree). -r recurses, --no-renames keeps paths literal,
-        # -z NUL-delimits so unusual filenames survive.
+        # Status + name of every path the commit changed vs its parent (root
+        # commit: vs the empty tree). -r recurses, --no-renames keeps paths
+        # literal (and statuses to A/M/D/T), -z NUL-delimits so unusual
+        # filenames survive: the stream alternates status, path, status, path.
         changed = git(
-            "show", "--no-renames", "--name-only", "--format=", "-r", "-z",
+            "show", "--no-renames", "--name-status", "--format=", "-r", "-z",
             head_sha,
         )
         if changed.returncode != 0:
             return False
-        paths = [p for p in changed.stdout.split("\0") if p]
-        if not paths:
+        fields = changed.stdout.split("\0")
+        # Well-formed output is status/path pairs plus a trailing empty field,
+        # so an even length means a dangling status. zip would silently drop
+        # it, and a dropped entry errs toward a false skip, so treat it as
+        # uninspectable instead.
+        if len(fields) % 2 == 0:
             return False
-        return all(p in allowed for p in paths)
+        entries = [
+            (status, path)
+            for status, path in zip(fields[0::2], fields[1::2])
+            if path
+        ]
+        if not entries:
+            return False
+        return all(
+            path in allowed or (status == "D" and path in allowed_deletions)
+            for status, path in entries
+        )
     except (OSError, subprocess.SubprocessError):
         return False
 
@@ -866,7 +917,7 @@ def open_release_asset_source(
     return the pinned file descriptor. Every segment is opened with
     O_NOFOLLOW/O_DIRECTORY so a symlink swapped onto a parent or the leaf after
     validation (a student process double-forked during grading survives into
-    post-grade staging) is rejected at open time — closing the validate-then-
+    post-grade staging) is rejected at open time, closing the validate-then-
     reopen TOCTOU. The returned fd is what _copy_release_asset reads from, so
     the copy can never re-resolve the path against a mutated tree. Caller owns
     closing the fd."""
@@ -926,7 +977,7 @@ def _copy_release_asset(
 ) -> int:
     """Copy from an already-open, symlink-free source fd (see
     open_release_asset_source) to `destination`, capped at max_bytes. Reading
-    the pinned fd — never re-opening by path — is what makes this copy immune to
+    the pinned fd (never re-opening by path) is what makes this copy immune to
     a symlink swapped in after validation."""
     copied = 0
     created = False
@@ -949,6 +1000,48 @@ def _copy_release_asset(
                 pass
         raise
     return copied
+
+
+def _looks_like_result_document(path: pathlib.Path, size: int | None = None) -> bool:
+    """True when a staged release asset is itself a result document.
+
+    Anyone with push access can rename a Release asset, and the readers accept
+    any result.json the workflow token uploaded. A student-authored file that
+    already carries the result schema is the one attachment a rename would turn
+    into a forged score, so the runner never attaches one. `size` is the byte
+    count when the caller already has it."""
+    try:
+        if (path.stat().st_size if size is None else size) > RESULT_SNIFF_MAX_BYTES:
+            return False
+        with path.open("rb") as fh:
+            # Most assets are PDFs, images, or archives: a first byte that can't
+            # open a JSON object or array settles it without reading the rest.
+            head = fh.read(64).lstrip(b" \t\n\r")
+            if head and head[:1] not in (b"{", b"["):
+                return False
+            # errors="replace": a decode failure must never clear a file, since
+            # a reader with a laxer decoder would still accept it.
+            text = (head + fh.read()).decode("utf-8", errors="replace")
+    except OSError:
+        return False
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    except RecursionError:
+        # json.loads raises this, not ValueError, on deep nesting. A file too
+        # deep to check can't be cleared, and letting it escape would crash the
+        # runner after grading, so refuse it.
+        raise ValueError("nested too deeply to check for a result document") from None
+    except ValueError as exc:
+        # A plain ValueError (not JSONDecodeError) is the integer digit limit:
+        # valid JSON Python won't parse but Go's decoder reads, so the sentinel
+        # could hide behind it. Not clearable either.
+        raise ValueError(f"could not check for a result document ({exc})") from None
+    if not isinstance(data, dict):
+        return False
+    schema = data.get("schema")
+    return isinstance(schema, str) and schema.startswith(RESULT_SCHEMA_PREFIX)
 
 
 def stage_release_assets(
@@ -991,6 +1084,11 @@ def stage_release_assets(
                 )
             finally:
                 os.close(source_fd)
+            if _looks_like_result_document(target, copied):
+                raise ValueError(
+                    f"{configured_path!r} is a {RESULT_SCHEMA_PREFIX}* document; "
+                    f"only the runner publishes one"
+                )
         except (OSError, ValueError) as exc:
             if copy_attempted:
                 try:
@@ -1079,7 +1177,7 @@ def _walk_workspace_files(workspace: pathlib.Path) -> list[str]:
 
 def _classify_disallowed(patterns: list[str], paths: list[str]) -> list[str] | None:
     """Subset of `paths` the `patterns` disallow, or None when the matcher
-    couldn't run (caller then skips enforcement — fail open). Delegates to `git
+    couldn't run (caller then skips enforcement: fail open). Delegates to `git
     check-ignore` against a throwaway, config-isolated repo. Mirrors Go's
     ignorematch.Disallowed; both pinned by the shared fixture
     cli/shared/testdata/allowed_files_matcher_cases.json."""
@@ -1088,7 +1186,7 @@ def _classify_disallowed(patterns: list[str], paths: list[str]) -> list[str] | N
     git_env = _isolated_git_env()
     # A hung git raises subprocess.TimeoutExpired (a SubprocessError, not an
     # OSError); a missing git binary raises OSError. Both must surface as
-    # "matcher couldn't run" (return None), not an uncaught traceback —
+    # "matcher couldn't run" (return None), not an uncaught traceback,
     # mirroring _baseline_scan's SubprocessError handling.
     try:
         with tempfile.TemporaryDirectory(prefix="classroom50-ignore-") as tmp:
@@ -1358,7 +1456,7 @@ def commit_submitted_at(sha: str, workspace: pathlib.Path) -> datetime.datetime:
     """The SUBMISSION instant for a graded commit: its committer date, read
     from git in the (full-depth) checkout and normalized to aware UTC. Invariant
     for a given commit, so re-grading it reproduces the identical `datetime` in
-    result.json — the submission time and `late` flag never move.
+    result.json, so the submission time and `late` flag never move.
 
     Falls back to now_utc() when the SHA is empty or git can't read the committer
     date (shallow clone, detached state, git error): lateness is advisory and a
@@ -1397,11 +1495,24 @@ def commit_submitted_at(sha: str, workspace: pathlib.Path) -> datetime.datetime:
 
 def mode_is_group(mode: str | None) -> bool:
     """True only when the assignment mode is exactly 'group' (case- and
-    whitespace-insensitive). Anything else — None, '', or unrecognized — is
+    whitespace-insensitive). Anything else (None, '', or unrecognized) is
     individual, so a missing/typo'd MODE env can never loosen validation (only
     require the stricter individual `assignment_type`). Mirrors the setup job's
     mode normalization."""
     return (mode or "").strip().lower() == "group"
+
+
+def assignment_type_for_mode(mode: str | None) -> str:
+    """Map the MODE env (the manifest mode, via the setup job) to the
+    result.json assignment_type: 'group' and 'team' pass through verbatim;
+    anything else (None, '', or unrecognized) is individual, the strictest
+    type, so a missing/typo'd MODE can never loosen validation. Keep the
+    accepted set in lockstep with the setup job's mode allow-list and
+    collect_scores.py's normalize_assignment_type."""
+    normalized = (mode or "").strip().lower()
+    if normalized in ("group", "team"):
+        return normalized
+    return "individual"
 
 
 # ---------------------------------------------------------------------------
@@ -1442,7 +1553,7 @@ class Finalizer:
         self.review_link = review_link
         self.submitted_by = submitted_by
         self.assignment_type = assignment_type
-        # The graded commit's committer date — the invariant submission instant
+        # The graded commit's committer date: the invariant submission instant
         # written as `datetime`. Defaults to now only when a caller didn't
         # resolve it (keeps older call sites / tests working).
         self.submitted_at = submitted_at or now_utc()
@@ -1464,7 +1575,7 @@ class Finalizer:
         summary = f"classroom50 autograde: {message}"
         (self.workspace / RESULT_FILENAME).write_text(json.dumps(result, indent=2) + "\n")
         (self.workspace / RELEASE_BODY_FILENAME).write_text(render_release_body(result, summary))
-        # Always overwrite — the autograder may have written a stale
+        # Always overwrite: the autograder may have written a stale
         # status= before exiting non-zero or producing bad output.
         append_outputs(self.github_output, "error", summary)
         return 0
@@ -1502,7 +1613,7 @@ class Finalizer:
 # Grades a bundled tests.json with a built-in interpreter. The specs are DATA,
 # never code: `run`/`setup` strings are teacher-authored shell, executed in the
 # student checkout at the same privilege as an autograder.py. They arrive via
-# the Pages bundle — never interpolated into workflow YAML — and students can't
+# the Pages bundle (never interpolated into workflow YAML) and students can't
 # edit assignments.json. The interpreter re-validates spec shape because the
 # file is hand-editable. Write-time validator: tests.go; trust-boundary
 # rationale: the Advanced-Autograding wiki page.
@@ -1573,8 +1684,9 @@ def _make_outcome(name: str, points: int, passed: bool, detail: str,
     """One test's outcome. Carries the v1 result-row fields plus rendering-only
     fields stripped before result.json: a `detail` summary line (the failure
     kind -- safe under every failure-details level) and a `capture` dict of raw
-    streams (stdout/stderr/setup-stdout/setup-stderr/expected) that the
-    renderers clip and policy-filter per surface."""
+    streams (`output` and `setup-output` for run/python tests, `stdout` /
+    `stderr` / `expected` for io tests) that the renderers clip and
+    policy-filter per surface."""
     if score is None:
         score = points if passed else 0
     return {
@@ -1615,16 +1727,30 @@ def _resolve_expected(spec: dict[str, Any], fixtures_dir: pathlib.Path) -> str:
     return spec.get("expected") or ""
 
 
+def _command_env(bundle_dir: pathlib.Path | None) -> dict[str, str]:
+    env = dict(os.environ)
+    if bundle_dir is not None:
+        env[BUNDLE_DIR_ENV] = str(bundle_dir.resolve())
+    return env
+
+
 def _run_command(command: str, cwd: pathlib.Path, timeout: int,
-                 stdin: str = "") -> subprocess.CompletedProcess[str]:
+                 stdin: str = "",
+                 bundle_dir: pathlib.Path | None = None,
+                 merge_streams: bool = False) -> subprocess.CompletedProcess[str]:
     """Run a shell command in the student checkout with captured text output
-    and an empty-by-default stdin."""
+    and an empty-by-default stdin. merge_streams folds stderr into stdout
+    (`2>&1`) so a failure reads as it did in the terminal; ordering still
+    follows the child's own buffering. io tests keep the streams apart because
+    the comparison reads stdout."""
     return subprocess.run(
         command,
         shell=True,
         cwd=str(cwd),
+        env=_command_env(bundle_dir),
         input=stdin,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT if merge_streams else subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
@@ -1632,14 +1758,15 @@ def _run_command(command: str, cwd: pathlib.Path, timeout: int,
     )
 
 
-def _run_setup(setup: str, cwd: pathlib.Path,
-               timeout: int) -> tuple[str | None, subprocess.CompletedProcess[str] | None]:
+def _run_setup(setup: str, cwd: pathlib.Path, timeout: int,
+               bundle_dir: pathlib.Path | None = None,
+               ) -> tuple[str | None, subprocess.CompletedProcess[str] | None]:
     """Run a test's setup command. Returns (error-summary, process): the
     summary is None on success; the process is None when the command never
-    produced one (timeout / failed start). Captured streams travel back raw so
-    the renderers can clip and policy-filter them per surface."""
+    produced one (timeout / failed start). The combined output travels back raw
+    so the renderers can clip and policy-filter it per surface."""
     try:
-        sp = _run_command(setup, cwd, timeout)
+        sp = _run_command(setup, cwd, timeout, bundle_dir=bundle_dir, merge_streams=True)
     except subprocess.TimeoutExpired:
         return f"setup timed out after {timeout}s", None
     except OSError as exc:
@@ -1675,7 +1802,8 @@ def _ensure_pytest(cwd: pathlib.Path, timeout: int) -> None:
 
 
 def _grade_python(spec: dict[str, Any], cwd: pathlib.Path, timeout: int,
-                  points: int, name: str) -> dict[str, Any]:
+                  points: int, name: str,
+                  bundle_dir: pathlib.Path | None = None) -> dict[str, Any]:
     """Split `points` across cases via pytest-json-report (deps auto-installed
     by _ensure_pytest), falling back to exit-code scoring when no report."""
     _ensure_pytest(cwd, timeout)
@@ -1688,7 +1816,7 @@ def _grade_python(spec: dict[str, Any], cwd: pathlib.Path, timeout: int,
     else:
         cmd = f"{spec['run']} --json-report --json-report-file={shlex.quote(str(report))}"
     try:
-        rp = _run_command(cmd, cwd, timeout)
+        rp = _run_command(cmd, cwd, timeout, bundle_dir=bundle_dir, merge_streams=True)
     except subprocess.TimeoutExpired:
         shutil.rmtree(report_dir, ignore_errors=True)
         return _make_outcome(name, points, False, f"timed out after {timeout}s")
@@ -1717,7 +1845,7 @@ def _grade_python(spec: dict[str, Any], cwd: pathlib.Path, timeout: int,
             score = min(score, max(0, points - 1))
         detail = f"pytest: {passed_n}/{total_n} cases passed"
         return _make_outcome(name, points, passed, detail, score=score,
-                             capture={"stdout": rp.stdout, "stderr": rp.stderr})
+                             capture={"output": rp.stdout})
 
     # Fallback: no parseable report -> all-or-nothing on the exit code
     # (e.g., an offline runner couldn't load pytest-json-report).
@@ -1725,7 +1853,7 @@ def _grade_python(spec: dict[str, Any], cwd: pathlib.Path, timeout: int,
     detail = (f"pytest exit {rp.returncode} "
               f"(no JSON report from pytest-json-report; scored on exit code)")
     return _make_outcome(name, points, passed, detail,
-                         capture={"stdout": rp.stdout, "stderr": rp.stderr})
+                         capture={"output": rp.stdout})
 
 
 def execute_test(spec: dict[str, Any], *, cwd: pathlib.Path,
@@ -1743,10 +1871,9 @@ def execute_test(spec: dict[str, Any], *, cwd: pathlib.Path,
     setup_capture: dict[str, str] = {}
     setup = spec.get("setup") or ""
     if setup:
-        err, sp = _run_setup(setup, cwd, timeout)
-        if sp is not None:
-            setup_capture = {k: v for k, v in
-                             (("setup-stdout", sp.stdout), ("setup-stderr", sp.stderr)) if v}
+        err, sp = _run_setup(setup, cwd, timeout, bundle_dir=fixtures_dir)
+        if sp is not None and sp.stdout:
+            setup_capture = {"setup-output": sp.stdout}
         if err:
             outcome = _make_outcome(name, points, False, err)
             outcome["failure-kind"] = "setup"
@@ -1754,14 +1881,18 @@ def execute_test(spec: dict[str, Any], *, cwd: pathlib.Path,
         outcome = _execute_spec(spec, cwd=cwd, fixtures_dir=fixtures_dir,
                                 name=name, points=points, timeout=timeout)
 
-    # Setup streams ride every outcome: a setup failure's details show them,
-    # and show-output includes them even on a pass (#764).
+    # Setup output rides every outcome: a setup failure's details show it,
+    # and show-output includes it even on a pass (#764).
     outcome["capture"] = {**setup_capture, **outcome.get("capture", {})}
     outcome["type"] = spec["type"]
     if spec["type"] == TEST_TYPE_IO:
         outcome["comparison"] = spec.get("comparison")
     outcome["failure-details"] = spec.get("failure-details") or FAILURE_DETAILS_FULL
     outcome["show-output"] = bool(spec.get("show-output"))
+    # The teacher's commands as written (not the pytest-augmented one), for the
+    # opt-in show-command rendering.
+    outcome["show-command"] = bool(spec.get("show-command"))
+    outcome["commands"] = {"setup": setup, "run": spec["run"]}
     return outcome
 
 
@@ -1771,7 +1902,7 @@ def _execute_spec(spec: dict[str, Any], *, cwd: pathlib.Path,
     """Run the spec's `run` phase (setup already done) and grade it."""
     ttype = spec["type"]
     if ttype == TEST_TYPE_PYTHON:
-        outcome = _grade_python(spec, cwd, timeout, points, name)
+        outcome = _grade_python(spec, cwd, timeout, points, name, bundle_dir=fixtures_dir)
         if not outcome["passed"]:
             outcome.setdefault("failure-kind", "cases")
         return outcome
@@ -1781,14 +1912,15 @@ def _execute_spec(spec: dict[str, Any], *, cwd: pathlib.Path,
     except TestFixtureError as exc:
         return _make_outcome(name, points, False, str(exc))
 
+    # io compares stdout, so only run tests merge streams.
+    merge = ttype == TEST_TYPE_RUN
     try:
-        rp = _run_command(spec["run"], cwd, timeout, stdin=stdin)
+        rp = _run_command(spec["run"], cwd, timeout, stdin=stdin,
+                          bundle_dir=fixtures_dir, merge_streams=merge)
     except subprocess.TimeoutExpired:
         return _make_outcome(name, points, False, f"timed out after {timeout}s")
     except OSError as exc:
         return _make_outcome(name, points, False, f"failed to start: {exc}")
-
-    capture = {"stdout": rp.stdout, "stderr": rp.stderr}
 
     if ttype == TEST_TYPE_RUN:
         want = spec.get("exit-code")
@@ -1796,12 +1928,13 @@ def _execute_spec(spec: dict[str, Any], *, cwd: pathlib.Path,
         passed = rp.returncode == want
         outcome = _make_outcome(name, points, passed,
                                 f"exit {rp.returncode} (wanted {want})",
-                                capture=capture)
+                                capture={"output": rp.stdout})
         if not passed:
             outcome["failure-kind"] = "exit"
         return outcome
 
     # io test.
+    capture = {"stdout": rp.stdout, "stderr": rp.stderr}
     try:
         expected = _resolve_expected(spec, fixtures_dir)
     except TestFixtureError as exc:
@@ -1822,7 +1955,7 @@ def _execute_spec(spec: dict[str, Any], *, cwd: pathlib.Path,
 
 
 def _validate_test_spec(t: Any) -> str | None:
-    """Re-validate one spec at grade time — a lower bar than tests.go that
+    """Re-validate one spec at grade time: a lower bar than tests.go that
     keeps a hand-edited assignments.json from crashing the grader."""
     if not isinstance(t, dict):
         return "not an object"
@@ -1831,7 +1964,7 @@ def _validate_test_spec(t: Any) -> str | None:
         return "name must be a non-empty string"
     # Mirror tests.go / tests-v1.schema.json: names are echoed into the release
     # body and, since the log report, into a column-0 `::group::FAIL: {name}`
-    # line — a control char there could inject a workflow command.
+    # line, where a control char could inject a workflow command.
     if any(ord(c) < 0x20 or ord(c) == 0x7f for c in name):
         return "name must not contain control characters"
     if t.get("type") not in TEST_TYPES:
@@ -1862,6 +1995,9 @@ def _validate_test_spec(t: Any) -> str | None:
     so = t.get("show-output")
     if so is not None and not isinstance(so, bool):
         return "show-output must be a boolean"
+    sc = t.get("show-command")
+    if sc is not None and not isinstance(sc, bool):
+        return "show-command must be a boolean"
     return None
 
 
@@ -1876,20 +2012,43 @@ def _validate_test_defaults(d: Any) -> str | None:
     so = d.get("show-output")
     if so is not None and not isinstance(so, bool):
         return "show-output must be a boolean"
+    sc = d.get("show-command")
+    if sc is not None and not isinstance(sc, bool):
+        return "show-command must be a boolean"
     return None
+
+
+# publish-pages always materializes a well-formed envelope, so a structurally
+# wrong tests.json means a teacher committed one by hand under
+# <classroom>/autograders/<slug>/ (see discussion #805). Point them back to the
+# supported authoring path instead of describing a format they never write.
+HAND_WRITTEN_TESTS_HINT = (
+    "Declarative tests are stored on the assignment and tests.json is generated "
+    "from them when the classroom50 repository publishes. Remove the tests.json "
+    "you committed under CLASSROOM/autograders/ASSIGNMENT/ and add the tests "
+    "with the web assignment form, `gh teacher assignment test add`, or "
+    "`gh teacher assignment test set --tests FILE` with that same file instead.")
 
 
 def load_tests(path: pathlib.Path) -> list[dict[str, Any]]:
     """Parse + re-validate a materialized tests.json, folding the envelope's
-    `defaults` (assignment-level failure-details / show-output) into each spec
-    that doesn't set its own. Raises TestsConfigError on any structural
-    problem."""
+    `defaults` (assignment-level failure-details / show-output / show-command)
+    into each spec that doesn't set its own. Raises TestsConfigError on any
+    structural problem."""
     data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, list):
+        # The predictable mistake: the bare array `gh teacher assignment add
+        # --tests` accepts, copied from the wiki into the bundle directory.
+        raise TestsConfigError(
+            f"{TESTS_FILENAME} is a bare test array, the `--tests` file format, "
+            f"not the generated bundle format. {HAND_WRITTEN_TESTS_HINT}")
     if not isinstance(data, dict):
-        raise TestsConfigError(f"{TESTS_FILENAME} is not a JSON object")
+        raise TestsConfigError(
+            f"{TESTS_FILENAME} is not a JSON object. {HAND_WRITTEN_TESTS_HINT}")
     if data.get("schema") != TESTS_SCHEMA_V1:
         raise TestsConfigError(
-            f"{TESTS_FILENAME} schema is {data.get('schema')!r}, want {TESTS_SCHEMA_V1!r}")
+            f"{TESTS_FILENAME} schema is {data.get('schema')!r}, want {TESTS_SCHEMA_V1!r}. "
+            f"{HAND_WRITTEN_TESTS_HINT}")
     tests = data.get("tests")
     if not isinstance(tests, list) or not tests:
         raise TestsConfigError(f"{TESTS_FILENAME} 'tests' must be a non-empty list")
@@ -1910,32 +2069,68 @@ def load_tests(path: pathlib.Path) -> list[dict[str, Any]]:
         if t["name"] in seen:
             raise TestsConfigError(f"{TESTS_FILENAME} tests[{i}]: duplicate test name {t['name']!r}")
         seen.add(t["name"])
-        for key in ("failure-details", "show-output"):
+        for key in ("failure-details", "show-output", "show-command"):
             if key not in t and key in defaults:
                 t[key] = defaults[key]
     return tests
+
+
+def _command_lines(outcome: dict[str, Any], *, include_run: bool = True) -> str:
+    """The `--- setup command --- / --- run command ---` blocks for a test that
+    opted in via show-command; empty otherwise. A setup failure passes
+    include_run=False: its run command never executed, and listing it above
+    the error would blame the wrong step."""
+    if not outcome.get("show-command"):
+        return ""
+    commands = outcome.get("commands") or {}
+    parts = []
+    for key, label in (("setup", "setup command"), ("run", "run command")):
+        if key == "run" and not include_run:
+            continue
+        text = (commands.get(key) or "").rstrip()
+        if text:
+            parts.append(f"--- {label} ---\n{text}")
+    return "\n".join(parts)
+
+
+def _setup_output_block(outcome: dict[str, Any], limit: int) -> str:
+    """The labelled `--- setup output ---` block of an outcome's setup command;
+    empty when it printed nothing."""
+    text = (outcome.get("capture") or {}).get("setup-output") or ""
+    if not text.strip():
+        return ""
+    return f"--- setup output ---\n{_clip(text, limit)}"
 
 
 def compose_detail(outcome: dict[str, Any], *, limit: int = MAX_CAPTURED_CHARS) -> str:
     """Failure text for one failing outcome, clipped to the surface's limit
     and honoring the test's failure-details level: `none` stops at the
     failure-kind summary line, `actual-only` adds only the student's own
-    streams, and `full` (the default) also shows the expected side."""
+    streams, and `full` (the default) also shows the expected side. The
+    commands are prepended when the test opted in via show-command."""
     level = outcome.get("failure-details") or FAILURE_DETAILS_FULL
     detail = (outcome.get("detail") or "").rstrip()
     if level == FAILURE_DETAILS_NONE:
         return detail
     cap = outcome.get("capture") or {}
     kind = outcome.get("failure-kind")
+    commands = _command_lines(outcome, include_run=kind != "setup")
+    if commands:
+        detail += f"\n{commands}"
     if kind == "setup":
-        out = cap.get("setup-stderr") or cap.get("setup-stdout") or ""
-        return detail + (f"\n{_clip(out, limit)}" if out else "")
-    if kind == "cases":
-        out = cap.get("stdout") or cap.get("stderr") or ""
-        return detail + (f"\n{_clip(out, limit)}" if out else "")
-    if kind == "exit":
-        out = cap.get("stderr") or cap.get("stdout") or ""
-        return detail + (f"\n{_clip(out, limit)}" if out else "")
+        block = _setup_output_block(outcome, limit)
+        return detail + (f"\n{block}" if block else "")
+    # A test that fails in its run phase skips the output section, so under
+    # show-output the setup output rides along here instead of vanishing.
+    if outcome.get("show-output"):
+        block = _setup_output_block(outcome, limit)
+        if block:
+            detail += f"\n{block}"
+    if kind in ("cases", "exit"):
+        # Safe at every failure-details level: these tests have no expected
+        # side to redact.
+        out = cap.get("output") or ""
+        return detail + (f"\n--- output ---\n{_clip(out, limit)}" if out.strip() else "")
     if kind == "output":
         comparison = outcome.get("comparison") or ""
         stdout = cap.get("stdout") or ""
@@ -1945,8 +2140,8 @@ def compose_detail(outcome: dict[str, Any], *, limit: int = MAX_CAPTURED_CHARS) 
             # or pattern, so those keep the verbatim expected/actual blocks.
             # The exact comparison also sees separator characters splitlines()
             # folds away (\x0c, \x85, \u2028, a literal \r in an inline
-            # expected), so a failing exact test can yield an empty diff —
-            # fall back to the same verbatim blocks rather than show FAIL with
+            # expected), so a failing exact test can yield an empty diff.
+            # Fall back to the same verbatim blocks rather than show FAIL with
             # no explanation.
             diff = (_unified_diff(cap.get("expected") or "", stdout)
                     if comparison == COMPARISON_EXACT else "")
@@ -1970,19 +2165,23 @@ def compose_detail(outcome: dict[str, Any], *, limit: int = MAX_CAPTURED_CHARS) 
 
 
 def compose_output(outcome: dict[str, Any], *, limit: int = MAX_CAPTURED_CHARS) -> str:
-    """Captured setup/run streams of one outcome for the opt-in show-output
+    """Captured setup/run output of one outcome for the opt-in show-output
     section (#764) -- rendered for passing tests, since failing ones already
-    surface their output through the failure details."""
+    surface their output through the failure details. The commands lead when
+    the test also opted in via show-command."""
     cap = outcome.get("capture") or {}
-    parts = []
-    for key, label in (("setup-stdout", "setup stdout"),
-                       ("setup-stderr", "setup stderr"),
+    outputs = []
+    for key, label in (("setup-output", "setup output"),
+                       ("output", "output"),
                        ("stdout", "stdout"),
                        ("stderr", "stderr")):
         text = cap.get(key) or ""
         if text.strip():
-            parts.append(f"--- {label} ---\n{_clip(text, limit)}")
-    return "\n".join(parts) or "(no output captured)"
+            outputs.append(f"--- {label} ---\n{_clip(text, limit)}")
+    if not outputs:
+        outputs.append("(no output captured)")
+    commands = _command_lines(outcome)
+    return "\n".join(([commands] if commands else []) + outputs)
 
 
 def render_declarative_body(result: dict[str, Any], outcomes: list[dict[str, Any]],
@@ -2053,7 +2252,7 @@ def _strip_control_chars(text: str) -> str:
 def render_log_report(outcomes: list[dict[str, Any]], *, color: bool) -> str:
     """Per-test report for the workflow log: a PASS/FAIL line per test, then
     one collapsible ::group:: per failing test with its captured detail, then
-    one per passing show-output test. Only those get groups — folding every
+    one per passing show-output test. Only those get groups: folding every
     passing test would bury the red ones. The release body carries the same
     data as Markdown; this is the log-surface rendering (ANSI is fine here,
     Markdown tables are not). The log clips at MAX_LOG_CAPTURED_CHARS, far
@@ -2062,7 +2261,7 @@ def render_log_report(outcomes: list[dict[str, Any]], *, color: bool) -> str:
 
     Detail lines are indented two spaces: detail carries student-controlled
     program output, and GitHub only interprets workflow commands (::error::,
-    ::endgroup::, ::stop-commands::) at column 0 — the indent makes command
+    ::endgroup::, ::stop-commands::) at column 0, so the indent makes command
     injection impossible. This is the log-surface analogue of _fence on the
     Markdown surface.
     """
@@ -2193,7 +2392,10 @@ def run_declarative(tests_path: pathlib.Path, finalize: Finalizer,
     never fails the runner."""
     try:
         tests = load_tests(tests_path)
-    except (json.JSONDecodeError, TestsConfigError, OSError) as exc:
+    except TestsConfigError as exc:
+        # Already names the file and says what to do next.
+        return finalize.error(str(exc))
+    except (json.JSONDecodeError, OSError) as exc:
         return finalize.error(f"{TESTS_FILENAME}: {exc}")
 
     grader = DeclarativeGrader(
@@ -2211,7 +2413,7 @@ def run_declarative(tests_path: pathlib.Path, finalize: Finalizer,
         submitted_at=finalize.submitted_at,
     )
     # Backstop: execute_test/load_tests handle expected failures; the broad
-    # catch guarantees the "grading outcomes always exit 0" invariant — an
+    # catch guarantees the "grading outcomes always exit 0" invariant: an
     # unexpected exception becomes a published error result, never a crash.
     try:
         result, outcomes = grader.grade(tests)
@@ -2222,7 +2424,7 @@ def run_declarative(tests_path: pathlib.Path, finalize: Finalizer,
     # keeps parity with collect_scores ingest and catches drift early.
     err = validate_result(
         result, classroom=finalize.classroom, assignment=finalize.assignment,
-        is_group=(finalize.assignment_type == "group"), owner=finalize.username,
+        expected_type=finalize.assignment_type, owner=finalize.username,
     )
     if err is not None:
         return finalize.error(f"declarative grader produced invalid result: {err}")
@@ -2253,22 +2455,22 @@ def run_declarative(tests_path: pathlib.Path, finalize: Finalizer,
 def fetch_bundle(finalize: Finalizer, *, pages_base_url: str, classroom: str,
                  assignment: str, runtime_dir: pathlib.Path, secret: str = "") -> int | None:
     """Download the per-assignment bundle from Pages and extract it into
-    `runtime_dir`. A 404 means "no per-assignment override" — fine, the resolver
-    falls through to the classroom default. Returns an rc (already finalized as
+    `runtime_dir`. A 404 means "no per-assignment override", which is fine: the
+    resolver falls through to the classroom default. Returns an rc (already finalized as
     an error) on a hard fetch/extract failure, or None to continue."""
     burl = bundle_url(pages_base_url, classroom, assignment, secret)
     print(f"runner: fetching bundle {burl}")
     try:
         bundle = fetch_url(burl)
     except (urllib.error.HTTPError, urllib.error.URLError, ValueError) as exc:
-        return finalize.error(f"bundle fetch failed: {exc} — see workflow logs")
+        return finalize.error(f"bundle fetch failed: {exc}. See workflow logs")
 
     if bundle is not None:
         print(f"runner: bundle size {len(bundle)} bytes")
         try:
             extract_tarball(bundle, runtime_dir)
         except (tarfile.TarError, OSError, ValueError) as exc:
-            return finalize.error(f"bundle extraction failed: {exc} — see workflow logs")
+            return finalize.error(f"bundle extraction failed: {exc}. See workflow logs")
     return None
 
 
@@ -2285,8 +2487,8 @@ def resolve_entrypoint(
     the same slug (it's the escape hatch).
 
     Returns exactly one of two shapes (never both-set, never both-None):
-      (entrypoint, None)  — a Python entrypoint to exec; main() continues.
-      (None, rc)          — the step is TERMINAL and rc is main()'s return
+      (entrypoint, None): a Python entrypoint to exec; main() continues.
+      (None, rc):         the step is TERMINAL and rc is main()'s return
                             value: declarative grader ran (run_declarative),
                             nothing configured (no_autograder), or the default
                             fetch failed (error).
@@ -2324,15 +2526,25 @@ def resolve_entrypoint(
 
 def run_entrypoint(
     finalize: Finalizer, entrypoint: pathlib.Path, workspace: pathlib.Path,
+    *, bundle_dir: pathlib.Path | None = None,
 ) -> int | None:
     """Exec the entrypoint with the helper env vars and cwd at the student's
     checkout. Returns an rc (already finalized as an error) on a failed
     invocation or a non-zero autograder exit, else None to continue.
 
+    `bundle_dir` is where fetch_bundle extracted the per-assignment bundle. It
+    is what CLASSROOM50_BUNDLE_DIR names, even for the classroom DEFAULT
+    entrypoint (written beside it, not inside it), so a default autograder.py
+    can still reach a bundle that ships only fixtures. With no bundle (a 404,
+    or nothing extracted) the entrypoint's own directory is the fallback.
+
     The USERNAME / *_URL helper env vars are read off `finalize` (the identity
     carrier), matching run_declarative, rather than re-threading them through
     the signature."""
     env = dict(os.environ)
+    if bundle_dir is None or not bundle_dir.is_dir():
+        bundle_dir = entrypoint.parent
+    env[BUNDLE_DIR_ENV] = str(bundle_dir.resolve())
     env["USERNAME"] = finalize.username
     env["OWNER"] = finalize.username
     env["ASSIGNMENT_TYPE"] = finalize.assignment_type
@@ -2353,12 +2565,12 @@ def run_entrypoint(
     return None
 
 
-def finalize_result(finalize: Finalizer, *, is_group: bool) -> int:
+def finalize_result(finalize: Finalizer) -> int:
     """Read + validate the autograder's result.json, then synthesize the release
     body and status/summary outputs it didn't write. Returns the runner's exit
     code (0 on success; an error rc when the result is missing/malformed/invalid).
-    Identity/paths are read off `finalize`; `is_group` is the one stage-local
-    input (it drives the `assignment_type` check in validate_result)."""
+    Identity/paths (including the expected `assignment_type`) are read off
+    `finalize`."""
     workspace = finalize.workspace
     github_output = finalize.github_output
     result_path = workspace / RESULT_FILENAME
@@ -2371,7 +2583,7 @@ def finalize_result(finalize: Finalizer, *, is_group: bool) -> int:
 
     # Stamp the runner-authoritative identity fields BEFORE validation. A custom
     # autograder builds its own result.json and can't be trusted to set `owner`
-    # (repo owner) or `assignment_type` (mode) — the runner knows both. Overwrite
+    # (repo owner) or `assignment_type` (mode); the runner knows both. Overwrite
     # so a student-influenced result.json can't claim a different owner/type.
     if isinstance(result, dict):
         result["owner"] = finalize.username
@@ -2384,7 +2596,7 @@ def finalize_result(finalize: Finalizer, *, is_group: bool) -> int:
         result["graded_at"] = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
         # The actual pusher (GITHUB_ACTOR), also runner-authoritative. Stamp
         # unconditionally: set it when known, DROP any autograder-written
-        # `submitted_by` when the actor couldn't be resolved — never let a
+        # `submitted_by` when the actor couldn't be resolved. Never let a
         # custom result.json's self-asserted (student-influenced) pusher survive.
         if finalize.submitted_by is not None:
             result["submitted_by"] = finalize.submitted_by
@@ -2394,7 +2606,7 @@ def finalize_result(finalize: Finalizer, *, is_group: bool) -> int:
 
     err = validate_result(
         result, classroom=finalize.classroom, assignment=finalize.assignment,
-        is_group=is_group, owner=finalize.username,
+        expected_type=finalize.assignment_type, owner=finalize.username,
     )
     if err is not None:
         return finalize.error(err)
@@ -2439,12 +2651,12 @@ def detect_acceptance_mode() -> int:
             fh.write(f"is-shim-update={'true' if is_shim_update else 'false'}\n")
     if is_acceptance:
         print(
-            "::notice::acceptance commit detected — nothing to grade yet; "
+            "::notice::acceptance commit detected, nothing to grade yet; "
             "submit work (gh student submit) to be graded"
         )
     elif is_shim_update:
         print(
-            "::notice::autograder-trigger update detected — nothing to grade"
+            "::notice::autograder-trigger update detected, nothing to grade"
         )
     else:
         print("runner: not an acceptance commit; grading proceeds")
@@ -2462,7 +2674,7 @@ def main() -> int:
     if not (pages_base_url and classroom and assignment and submission):
         print(
             "::error::runner requires PAGES_BASE_URL, CLASSROOM, "
-            "ASSIGNMENT, and SUBMISSION_TAG — running outside the autograde-runner workflow?",
+            "ASSIGNMENT, and SUBMISSION_TAG. Running outside the autograde-runner workflow?",
             file=sys.stderr,
         )
         return 1
@@ -2474,8 +2686,8 @@ def main() -> int:
     secret = os.environ.get("SECRET", "").strip()
     if secret and not re.fullmatch(r"[a-z0-9]{4,64}", secret):
         print(
-            f"::error::SECRET {secret!r} is malformed (must be [a-z0-9]{{4,64}}) — "
-            "re-run `gh student accept` to regenerate .classroom50.yaml",
+            f"::error::SECRET {secret!r} is malformed (must be [a-z0-9]{{4,64}}). "
+            "Re-run `gh student accept` to regenerate .classroom50.yaml",
             file=sys.stderr,
         )
         return 1
@@ -2485,16 +2697,16 @@ def main() -> int:
     server_url = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
     actor = os.environ.get("GITHUB_ACTOR", "")
     # Assignment mode flows from assignments.json via the setup job's `mode`
-    # output. Unknown/missing defaults to individual (the stricter
+    # output. Unknown/missing defaults to individual (the strictest
     # `assignment_type`) so a missing env can't loosen validation.
-    is_group = mode_is_group(os.environ.get("MODE"))
+    assignment_type = assignment_type_for_mode(os.environ.get("MODE"))
     github_output = os.environ.get("GITHUB_OUTPUT")
     workspace = pathlib.Path.cwd()
 
     username = username_from_repo(repository, classroom, assignment, actor)
     commit_link = commit_url(server_url, repository, sha)
     release_link = release_url(server_url, repository, submission)
-    # Submission instant is the graded commit's committer date — stable across
+    # Submission instant is the graded commit's committer date, stable across
     # regrades, so re-grading the same commit never moves `datetime`/`late`.
     submitted_at = commit_submitted_at(sha, workspace)
     # Resolve the baseline once: both the review-compare link and the Feedback
@@ -2540,7 +2752,7 @@ def main() -> int:
         release_link=release_link,
         review_link=review_link,
         submitted_by=actor_identity(),
-        assignment_type="group" if is_group else "individual",
+        assignment_type=assignment_type,
         submitted_at=submitted_at,
     )
 
@@ -2554,7 +2766,7 @@ def main() -> int:
             f.unlink()
 
     # Enforce allowed_files before grading so the autograder only sees allowed
-    # files. Fails open — if the matcher can't run, returns [] and grading
+    # files. Fails open: if the matcher can't run, returns [] and grading
     # proceeds on the unfiltered tree (see its docstring to flip to fail-closed).
     # The removed list is appended to release-body.md on every exit path below.
     removed_files = enforce_allowed_files(workspace, parse_allowed_files(os.environ.get("ALLOWED_FILES")))
@@ -2576,11 +2788,13 @@ def main() -> int:
         if entrypoint is None:
             return rc  # declarative grader ran, vacuous pass, or fetch error
 
-        rc = run_entrypoint(finalize, entrypoint, workspace)
+        rc = run_entrypoint(
+            finalize, entrypoint, workspace, bundle_dir=runtime_dir / assignment,
+        )
         if rc is not None:
             return rc
 
-        return finalize_result(finalize, is_group=is_group)
+        return finalize_result(finalize)
 
     # Append the removed-files note on every exit path (incl. an exception
     # in grading): the files were already deleted before _grade() ran.
@@ -2588,7 +2802,7 @@ def main() -> int:
         rc = _grade()
     finally:
         append_removed_files_note(workspace, removed_files)
-        # Mirror the FINAL release body to the run's Summary page from here —
+        # Mirror the FINAL release body to the run's Summary page from here,
         # the one point every exit path (success, error, vacuous pass) passes
         # through, after the removed-files note has been folded in. Doing it
         # here (not in run_declarative / finalize_result / the note) keeps the
